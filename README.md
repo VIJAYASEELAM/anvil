@@ -52,14 +52,15 @@ Run an agent on all tasks and evaluate the patches:
 
 ```bash
 anvil run-evals \
-  --model openrouter/google/gemini-3-flash-preview \
-  --dataset file-utilization \
+  --model openrouter/google/gemini-2.5-flash \
+  --dataset datasets/file-utilization \
   --agent mini-swe-agent \
   --dockerhub-username YOUR_USERNAME \
-  --dockerhub-repo anvil-images
+  --dockerhub-repo anvil-images \
+  --n-attempts 3
 ```
 
-Results go to `datasets/<dataset>/runs/<agent>_<model>/`. 
+Use `--n-attempts` to control how many runs per task (useful for pass@k metrics). Results are saved to `<dataset>/runs/<agent>_<model>/`. 
 
 > 💡 **Progress is saved automatically** to minimize costs. If you re-run the same command, completed tasks are skipped—nothing runs on Modal for those tasks. Use `--no-continue` to start fresh.
 

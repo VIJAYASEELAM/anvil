@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,8 +14,6 @@ from pathlib import Path
 
 import typer
 from ruamel.yaml import YAML
-
-from .util import run
 
 
 @dataclass
@@ -119,8 +118,8 @@ def _patch_dockerfile_if_needed(dockerfile: Path) -> str:
     return content
 
 
-def _build_and_push(task: BuildTask, username: str, repo: str, platform: str) -> str | None:
-    """Build and push a Docker image. Returns tag on success, None on failure."""
+def _build_and_push(task: BuildTask, username: str, repo: str, platform: str) -> tuple[str | None, str | None]:
+    """Build and push a Docker image. Returns (tag, None) on success, (None, error) on failure."""
     tag = task.tag(username, repo)
 
     # Write patched Dockerfile to context directory (Docker buildx needs stable path)
@@ -136,13 +135,15 @@ def _build_and_push(task: BuildTask, username: str, repo: str, platform: str) ->
             "-t", tag,
             str(task.context),
         ]
-        if run(build_cmd, quiet=True) != 0:
-            return None
+        result = subprocess.run(build_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None, result.stderr.strip().split("\n")[-1] or "build failed"
 
-        if run(["docker", "push", tag], quiet=True) != 0:
-            return None
+        result = subprocess.run(["docker", "push", tag], capture_output=True, text=True)
+        if result.returncode != 0:
+            return None, result.stderr.strip().split("\n")[-1] or "push failed"
 
-        return tag
+        return tag, None
     finally:
         patched_dockerfile.unlink(missing_ok=True)
 
@@ -212,15 +213,15 @@ def publish_images(
         for i, future in enumerate(as_completed(futures), 1):
             task = futures[future]
             try:
-                tag = future.result()
+                tag, err = future.result()
                 if tag:
                     typer.echo(f"[{i}/{len(build_tasks)}] {task.name} ✓")
                     built[task.name] = tag
                 else:
-                    typer.echo(f"[{i}/{len(build_tasks)}] {task.name} ✗", err=True)
+                    typer.echo(f"[{i}/{len(build_tasks)}] {task.name} ✗ {err}", err=True)
                     failed.append(task.name)
             except Exception as e:
-                typer.echo(f"[{i}/{len(build_tasks)}] {task.name} ✗ ({e})", err=True)
+                typer.echo(f"[{i}/{len(build_tasks)}] {task.name} ✗ {e}", err=True)
                 failed.append(task.name)
 
     if not built:

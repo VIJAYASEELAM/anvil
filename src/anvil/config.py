@@ -17,7 +17,7 @@ def datasets_dir() -> Path:
 
 def dataset_dir(dataset_id: str) -> Path:
     """Return the directory for a specific dataset."""
-    return datasets_dir() / dataset_id
+    return repo_root() / dataset_id
 
 
 def tasks_dir(dataset_id: str) -> Path:

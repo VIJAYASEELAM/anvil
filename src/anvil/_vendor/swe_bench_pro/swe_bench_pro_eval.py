@@ -87,7 +87,7 @@ def create_entryscript(sample):
     before_repo_set_cmd = sample["before_repo_set_cmd"].strip().split("\n")[-1]
     selected_test_files_to_run = ",".join(eval(sample["selected_test_files_to_run"]))
     base_commit = sample["base_commit"]
-    base_dockerfile = load_base_docker(sample["instance_id"])
+    base_dockerfile = load_base_docker(sample["repo_name"])
     instance_dockerfile = instance_docker(sample["instance_id"])
 
     env_cmds = []
@@ -392,19 +392,21 @@ def main():
     raw_sample_df = raw_sample_df.fillna("")
     raw_sample_df = raw_sample_df.set_index("instance_id", drop=False)
     
-    # Load instances.yaml to get image_name field if it exists
+    # Load instances.yaml to get image_name and repo_name fields if they exist
     instances_yaml_path = os.path.join(os.path.dirname(args.raw_sample_path), "instances.yaml")
     if os.path.exists(instances_yaml_path):
         try:
             import yaml
             with open(instances_yaml_path, "r") as f:
                 instances = yaml.safe_load(f)
-            # Create a mapping of instance_id to image_name
+            # Create mappings of instance_id to image_name and repo_name
             image_name_map = {inst["instance_id"]: inst.get("image_name", "") for inst in instances if isinstance(inst, dict)}
-            # Add image_name column to dataframe
+            repo_name_map = {inst["instance_id"]: inst.get("repo_name", "") for inst in instances if isinstance(inst, dict)}
+            # Add columns to dataframe
             raw_sample_df["image_name"] = raw_sample_df["instance_id"].map(image_name_map).fillna("")
+            raw_sample_df["repo_name"] = raw_sample_df["instance_id"].map(repo_name_map).fillna("")
         except Exception as e:
-            print(f"Warning: Could not load image names from instances.yaml: {e}")
+            print(f"Warning: Could not load fields from instances.yaml: {e}")
 
     with open(args.patch_path, "r") as f:
         patches_to_run = json.load(f)

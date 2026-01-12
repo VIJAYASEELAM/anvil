@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -184,9 +185,14 @@ def run_evaluation(
 
     start_time = time.time()
     eval_id = _eval_id(agent, model)
-    base_out = ensure_dir(
-        Path(output) if output else eval_output_dir(dataset_id, eval_id)
-    )
+    base_out_path = Path(output) if output else eval_output_dir(dataset_id, eval_id)
+    
+    # Handle --no-continue: delete existing results directory
+    if no_continue and base_out_path.exists():
+        shutil.rmtree(base_out_path)
+        typer.echo(f"Deleted existing results: {base_out_path}")
+    
+    base_out = ensure_dir(base_out_path)
     instances = load_instances(dataset_id)
     n_tasks = len(instances)
     dataset_tasks_dir = tasks_dir(dataset_id)
@@ -196,14 +202,6 @@ def run_evaluation(
     typer.echo(f"  Tasks: {n_tasks}")
     typer.echo(f"  Attempts: {k}")
     typer.echo(f"  Output: {base_out}")
-
-    # Handle --no-continue: delete existing results
-    if no_continue and base_out.exists():
-        for item in base_out.iterdir():
-            if item.is_dir() and item.name not in {"__errors"}:
-                shutil.rmtree(item)
-            elif item.is_file():
-                item.unlink()
 
     # Cleanup bad rollouts and get completed runs
     bad_moved = _cleanup_bad_rollouts(base_out, instances, k)
@@ -254,7 +252,7 @@ def run_evaluation(
                 })
 
             semaphore = asyncio.Semaphore(max_parallel)
-            pbar = tqdm(total=remaining_runs, desc="Agent runs", unit="run")
+            pbar = tqdm(total=remaining_runs, desc="Agent runs", unit="run", file=sys.stderr)
 
             async def run_one(inst: dict, attempt: int) -> AgentResult:
                 async with semaphore:
