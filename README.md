@@ -41,10 +41,12 @@ Go to [hub.docker.com](https://hub.docker.com) and create a new **private** repo
 Build and push Docker images for a dataset to your private repo:
 
 ```bash
-anvil publish-images --dataset datasets/file-utilization -u YOUR_USERNAME --repo anvil-images
+anvil publish-images --dataset datasets/file-utilization -u <dockerhub-username> --repo anvil-images
 ```
 
 Modal sandboxes pull images from Docker Hub, so task images need to be pushed there first.
+
+To remove local anvil images: `docker rmi $(docker images <dockerhub-username>/anvil-images -q) --force`
 
 ### Run evaluations
 
@@ -55,7 +57,7 @@ anvil run-evals \
   --model openrouter/google/gemini-2.5-flash \
   --dataset datasets/file-utilization \
   --agent mini-swe-agent \
-  --dockerhub-username YOUR_USERNAME \
+  --dockerhub-username <dockerhub-username> \
   --dockerhub-repo anvil-images \
   --n-attempts 3
 ```

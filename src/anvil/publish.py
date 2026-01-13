@@ -49,50 +49,39 @@ def _is_public_repo(username: str, repo: str) -> bool:
         return False  # Private repos return 404, unknown is treated as safe
 
 
-def _discover_build_tasks(tasks_dir: Path) -> list[BuildTask]:
+def _discover_build_tasks(tasks_dir: Path) -> tuple[list[BuildTask], list[BuildTask]]:
     """Find Docker images to build.
 
-    Structure:
-        dockerfiles/
-            docker_image_creation/<project>/  <- build contexts with source code
-            base_dockerfile/<project>/        <- template Dockerfile (skip)
-            base_dockerfile/<project>.task-N/ <- per-instance Dockerfile (build)
+    Returns (base_tasks, instance_tasks) - base images must be built first.
     """
     creation_dir = tasks_dir / "dockerfiles" / "docker_image_creation"
-    base_df_dir = tasks_dir / "dockerfiles" / "base_dockerfile"
     instance_df_dir = tasks_dir / "dockerfiles" / "instance_dockerfile"
 
     if not creation_dir.exists():
-        return []
+        return [], []
 
     contexts = {d.name: d for d in creation_dir.iterdir() if d.is_dir()}
-    tasks = []
 
-    # Prefer instance_dockerfile/, then base_dockerfile/, then creation_dir
+    # Base images: built from docker_image_creation/<project>/Dockerfile
+    base_tasks = []
+    for name, context in sorted(contexts.items()):
+        dockerfile = context / "Dockerfile"
+        if dockerfile.exists():
+            base_tasks.append(BuildTask(name=f"{name}.base", dockerfile=dockerfile, context=context))
+
+    # Instance images: built from instance_dockerfile/<project>.<task>/Dockerfile
+    instance_tasks = []
     if instance_df_dir.exists():
-        dockerfile_dir = instance_df_dir
-    elif base_df_dir.exists():
-        dockerfile_dir = base_df_dir
-    else:
-        dockerfile_dir = creation_dir
+        for task_dir in sorted(instance_df_dir.iterdir()):
+            dockerfile = task_dir / "Dockerfile"
+            if not task_dir.is_dir() or not dockerfile.exists():
+                continue
+            project = task_dir.name.partition(".")[0]
+            context = contexts.get(project)
+            if context:
+                instance_tasks.append(BuildTask(name=task_dir.name, dockerfile=dockerfile, context=context))
 
-    for task_dir in sorted(dockerfile_dir.iterdir()):
-        dockerfile = task_dir / "Dockerfile"
-        if not task_dir.is_dir() or not dockerfile.exists():
-            continue
-
-        # Skip project template dirs (exact match = template, not instance)
-        if task_dir.name in contexts:
-            continue
-
-        # Instance name format: <project>.<task> -> context is <project>
-        project = task_dir.name.partition(".")[0]
-        context = contexts.get(project)
-
-        if context:
-            tasks.append(BuildTask(name=task_dir.name, dockerfile=dockerfile, context=context))
-
-    return tasks
+    return base_tasks, instance_tasks
 
 
 def _patch_dockerfile_if_needed(dockerfile: Path, username: str, repo: str) -> str:
@@ -124,31 +113,24 @@ def _patch_dockerfile_if_needed(dockerfile: Path, username: str, repo: str) -> s
 def _build_and_push(task: BuildTask, username: str, repo: str, platform: str) -> tuple[str | None, str | None]:
     """Build and push a Docker image. Returns (tag, None) on success, (None, error) on failure."""
     tag = task.tag(username, repo)
-
-    # Write patched Dockerfile to context directory (Docker buildx needs stable path)
     patched_content = _patch_dockerfile_if_needed(task.dockerfile, username, repo)
-    patched_dockerfile = task.context / f".Dockerfile.{task.name}"
-    patched_dockerfile.write_text(patched_content)
 
-    try:
-        build_cmd = [
-            "docker", "build",
-            "--platform", platform,
-            "-f", str(patched_dockerfile),
-            "-t", tag,
-            str(task.context),
-        ]
-        result = subprocess.run(build_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            return None, result.stderr.strip().split("\n")[-1] or "build failed"
+    build_cmd = [
+        "docker", "build",
+        "--platform", platform,
+        "-f", "-",
+        "-t", tag,
+        str(task.context),
+    ]
+    result = subprocess.run(build_cmd, input=patched_content, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None, result.stderr.strip().split("\n")[-1] or "build failed"
 
-        result = subprocess.run(["docker", "push", tag], capture_output=True, text=True)
-        if result.returncode != 0:
-            return None, result.stderr.strip().split("\n")[-1] or "push failed"
+    result = subprocess.run(["docker", "push", tag], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None, result.stderr.strip().split("\n")[-1] or "push failed"
 
-        return tag, None
-    finally:
-        patched_dockerfile.unlink(missing_ok=True)
+    return tag, None
 
 
 def _update_instances_yaml(
@@ -197,35 +179,43 @@ def publish_images(
         typer.echo(f"Repository {dockerhub_username}/{repo_name} is PUBLIC. Refusing to push.", err=True)
         raise typer.Exit(1)
 
-    build_tasks = _discover_build_tasks(tasks_dir)
-    if not build_tasks:
+    base_tasks, instance_tasks = _discover_build_tasks(tasks_dir)
+    all_tasks = base_tasks + instance_tasks
+    if not all_tasks:
         typer.echo(f"No Dockerfiles found in {tasks_dir}/dockerfiles/", err=True)
         raise typer.Exit(1)
 
-    typer.echo(f"Building {len(build_tasks)} image(s)...")
+    typer.echo(f"Building {len(all_tasks)} image(s) ({len(base_tasks)} base + {len(instance_tasks)} instance)...")
 
     built: dict[str, str] = {}
     failed: list[str] = []
+    counter = [0]  # mutable for closure
 
-    with ThreadPoolExecutor(max_workers=min(len(build_tasks), max_workers)) as executor:
-        futures = {
-            executor.submit(_build_and_push, task, dockerhub_username, repo_name, platform): task
-            for task in build_tasks
-        }
-
-        for i, future in enumerate(as_completed(futures), 1):
-            task = futures[future]
-            try:
-                tag, err = future.result()
-                if tag:
-                    typer.echo(f"[{i}/{len(build_tasks)}] {task.name} ✓")
-                    built[task.name] = tag
-                else:
-                    typer.echo(f"[{i}/{len(build_tasks)}] {task.name} ✗ {err}", err=True)
+    def run_builds(tasks: list[BuildTask]) -> None:
+        if not tasks:
+            return
+        with ThreadPoolExecutor(max_workers=min(len(tasks), max_workers)) as executor:
+            futures = {
+                executor.submit(_build_and_push, task, dockerhub_username, repo_name, platform): task
+                for task in tasks
+            }
+            for future in as_completed(futures):
+                counter[0] += 1
+                task = futures[future]
+                try:
+                    tag, err = future.result()
+                    if tag:
+                        typer.echo(f"[{counter[0]}/{len(all_tasks)}] {task.name} ✓")
+                        built[task.name] = tag
+                    else:
+                        typer.echo(f"[{counter[0]}/{len(all_tasks)}] {task.name} ✗ {err}", err=True)
+                        failed.append(task.name)
+                except Exception as e:
+                    typer.echo(f"[{counter[0]}/{len(all_tasks)}] {task.name} ✗ {e}", err=True)
                     failed.append(task.name)
-            except Exception as e:
-                typer.echo(f"[{i}/{len(build_tasks)}] {task.name} ✗ {e}", err=True)
-                failed.append(task.name)
+
+    run_builds(base_tasks)
+    run_builds(instance_tasks)
 
     if not built:
         typer.echo("All builds failed", err=True)
