@@ -95,9 +95,12 @@ def _discover_build_tasks(tasks_dir: Path) -> list[BuildTask]:
     return tasks
 
 
-def _patch_dockerfile_if_needed(dockerfile: Path) -> str:
+def _patch_dockerfile_if_needed(dockerfile: Path, username: str, repo: str) -> str:
     """Return Dockerfile content with COPY . . inserted after FROM if missing."""
     content = dockerfile.read_text()
+
+    # Rewrite FROM to use user's repo
+    content = re.sub(r"^(FROM\s+)\S+/\S+:", rf"\1{username}/{repo}:", content, count=1, flags=re.MULTILINE)
 
     if re.search(r"(?:COPY|ADD)\s+\.\s", content):
         return content
@@ -123,7 +126,7 @@ def _build_and_push(task: BuildTask, username: str, repo: str, platform: str) ->
     tag = task.tag(username, repo)
 
     # Write patched Dockerfile to context directory (Docker buildx needs stable path)
-    patched_content = _patch_dockerfile_if_needed(task.dockerfile)
+    patched_content = _patch_dockerfile_if_needed(task.dockerfile, username, repo)
     patched_dockerfile = task.context / f".Dockerfile.{task.name}"
     patched_dockerfile.write_text(patched_content)
 
