@@ -35,6 +35,9 @@ from .pass_at_k import (
 
 def _eval_id(agent: str, model: str) -> str:
     """Compose eval_id as '<agent>_<model-suffix>'."""
+    # Oracle agent doesn't use a model, so just use "oracle"
+    if agent == "oracle":
+        return "oracle"
     base = model_id_from_model(model)
     return f"{agent}_{base}" if agent else base
 
@@ -136,7 +139,7 @@ def _cleanup_bad_evals(
 
 
 def run_evaluation(
-    model: str,
+    model: str | None,
     dataset_id: str,
     dockerhub_username: str,
     dockerhub_repo: str,
@@ -156,6 +159,13 @@ def run_evaluation(
         load_dotenv(Path(__file__).resolve().parents[3] / ".env")
     except ImportError:
         pass
+
+    # Oracle agent doesn't need a model - use "oracle" as default
+    if agent == "oracle":
+        model = model or "oracle"
+    elif not model:
+        typer.echo("Error: --model is required for non-oracle agents")
+        return 1
 
     # Validate registry credentials upfront - required for both agent runs and evals
     reg_user = os.environ.get("REGISTRY_USERNAME")
@@ -203,113 +213,135 @@ def run_evaluation(
     typer.echo(f"  Attempts: {k}")
     typer.echo(f"  Output: {base_out}")
 
-    # Cleanup bad rollouts and get completed runs
-    bad_moved = _cleanup_bad_rollouts(base_out, instances, k)
-    completed_rollouts = _get_completed_rollouts(base_out, instances, k)
-
-    # Build work items in task-first order
-    work_items: list[tuple[dict, int]] = []
-    for inst in instances:
-        iid = inst["instance_id"]
-        for attempt in range(1, k + 1):
-            if (iid, attempt) not in completed_rollouts:
-                work_items.append((inst, attempt))
-
-    total_runs = n_tasks * k
-    remaining_runs = len(work_items)
-    complete_runs = total_runs - remaining_runs
-
-    # Status line
-    if remaining_runs == 0:
-        typer.echo(f"Rollouts: {complete_runs}/{total_runs} complete, nothing to run")
-    else:
-        status = f"Rollouts: {complete_runs}/{total_runs} complete, running {remaining_runs}"
-        if bad_moved > 0:
-            status += f" ({bad_moved} bad moved to __errors/)"
-        typer.echo(status)
-
-        agent_config = AGENT_CONFIGS[agent]
-        provider_env = provider_env_var_from_model(model)
-        keep_n = min(k, 10)
-
-        results_by_instance: dict[str, list[AgentResult | None]] = {
-            i["instance_id"]: [None] * k for i in instances
-        }
-
-        async def run_all_agents():
-            import modal
-
-            modal.enable_output()
-            os.environ.setdefault("MODAL_MAX_THROTTLE_WAIT", str(max_wait_minutes * 60))
-
-            app = modal.App.lookup("anvil-agent-harness", create_if_missing=True)
-
-            registry_secret = None
-            if os.environ.get("REGISTRY_USERNAME") and os.environ.get("REGISTRY_PASSWORD"):
-                registry_secret = modal.Secret.from_dict({
-                    "REGISTRY_USERNAME": os.environ["REGISTRY_USERNAME"],
-                    "REGISTRY_PASSWORD": os.environ["REGISTRY_PASSWORD"],
+    # ---- Oracle: skip rollout, use gold_patches.json directly ----
+    if agent == "oracle":
+        gold_patches_path = dataset_tasks_dir / "gold_patches.json"
+        if not gold_patches_path.exists():
+            typer.echo(f"Error: gold_patches.json not found at {gold_patches_path}")
+            return 1
+        
+        gold_patches = json.loads(gold_patches_path.read_text())
+        typer.echo(f"Loaded {len(gold_patches)} golden patches")
+        
+        # Build patches for eval, add attempt=1
+        bad_eval_moved = _cleanup_bad_evals(base_out, instances, k, eval_id)
+        completed_evals = _get_completed_evals(base_out, instances, k, eval_id)
+        
+        all_patches = []
+        for p in gold_patches:
+            iid = p["instance_id"]
+            if (iid, 1) not in completed_evals:
+                all_patches.append({
+                    "instance_id": iid,
+                    "patch": p.get("patch", ""),
+                    "prefix": eval_id,
+                    "attempt": 1,
                 })
+    else:
+        # ---- Non-oracle: run agent rollouts ----
+        bad_moved = _cleanup_bad_rollouts(base_out, instances, k)
+        completed_rollouts = _get_completed_rollouts(base_out, instances, k)
 
-            semaphore = asyncio.Semaphore(max_parallel)
-            pbar = tqdm(total=remaining_runs, desc="Agent runs", unit="run", file=sys.stderr)
+        work_items: list[tuple[dict, int]] = []
+        for inst in instances:
+            iid = inst["instance_id"]
+            for attempt in range(1, k + 1):
+                if (iid, attempt) not in completed_rollouts:
+                    work_items.append((inst, attempt))
 
-            async def run_one(inst: dict, attempt: int) -> AgentResult:
-                async with semaphore:
-                    result = await run_agent_in_modal(
-                        agent_config=agent_config,
-                        instance=inst,
-                        model=model,
-                        provider_env_var=provider_env,
-                        app=app,
-                        registry_secret=registry_secret,
-                    )
+        total_runs = n_tasks * k
+        remaining_runs = len(work_items)
+        complete_runs = total_runs - remaining_runs
 
-                    iid = result.instance_id
-                    results_by_instance[iid][attempt - 1] = result
+        if remaining_runs == 0:
+            typer.echo(f"Rollouts: {complete_runs}/{total_runs} complete, nothing to run")
+        else:
+            status = f"Rollouts: {complete_runs}/{total_runs} complete, running {remaining_runs}"
+            if bad_moved > 0:
+                status += f" ({bad_moved} bad moved to __errors/)"
+            typer.echo(status)
 
-                    if attempt <= keep_n:
-                        result_dir = base_out / iid / f"attempt_{attempt}" / "rollout"
-                        write_single_result(result, result_dir, eval_id)
+            agent_config = AGENT_CONFIGS[agent]
+            provider_env = provider_env_var_from_model(model)
+            keep_n = min(k, 10)
 
-                    status = "ok" if result.exit_code == 0 and not result.error else "fail"
-                    pbar.set_postfix_str(f"{iid}:{attempt} {status}")
-                    pbar.update(1)
+            results_by_instance: dict[str, list[AgentResult | None]] = {
+                i["instance_id"]: [None] * k for i in instances
+            }
 
-                    return result
+            async def run_all_agents():
+                import modal
 
-            tasks = [
-                asyncio.create_task(run_one(inst, attempt))
-                for inst, attempt in work_items
-            ]
-            await asyncio.gather(*tasks)
-            pbar.close()
+                modal.enable_output()
+                os.environ.setdefault("MODAL_MAX_THROTTLE_WAIT", str(max_wait_minutes * 60))
 
-        typer.echo(f"Running agents (max {max_parallel} parallel)...")
-        asyncio.run(run_all_agents())
+                app = modal.App.lookup("anvil-agent-harness", create_if_missing=True)
 
-    # ---- Evaluation Phase ----
-    bad_eval_moved = _cleanup_bad_evals(base_out, instances, k, eval_id)
-    completed_evals = _get_completed_evals(base_out, instances, k, eval_id)
+                registry_secret = None
+                if os.environ.get("REGISTRY_USERNAME") and os.environ.get("REGISTRY_PASSWORD"):
+                    registry_secret = modal.Secret.from_dict({
+                        "REGISTRY_USERNAME": os.environ["REGISTRY_USERNAME"],
+                        "REGISTRY_PASSWORD": os.environ["REGISTRY_PASSWORD"],
+                    })
 
-    # Build patches list, skipping completed evals
-    all_patches = []
-    for inst in instances:
-        iid = inst["instance_id"]
-        for attempt in range(1, k + 1):
-            if (iid, attempt) in completed_evals:
-                continue
+                semaphore = asyncio.Semaphore(max_parallel)
+                pbar = tqdm(total=remaining_runs, desc="Agent runs", unit="run", file=sys.stderr)
 
-            pred_path = base_out / iid / f"attempt_{attempt}" / "rollout" / f"{iid}.pred"
-            patch = ""
-            if pred_path.exists():
-                try:
-                    pred_data = json.loads(pred_path.read_text())
-                    patch = pred_data.get("model_patch", "")
-                except (json.JSONDecodeError, OSError):
-                    pass
+                async def run_one(inst: dict, attempt: int) -> AgentResult:
+                    async with semaphore:
+                        result = await run_agent_in_modal(
+                            agent_config=agent_config,
+                            instance=inst,
+                            model=model,
+                            provider_env_var=provider_env,
+                            app=app,
+                            registry_secret=registry_secret,
+                        )
 
-            all_patches.append({
+                        iid = result.instance_id
+                        results_by_instance[iid][attempt - 1] = result
+
+                        if attempt <= keep_n:
+                            result_dir = base_out / iid / f"attempt_{attempt}" / "rollout"
+                            write_single_result(result, result_dir, eval_id)
+
+                        status = "ok" if result.exit_code == 0 and not result.error else "fail"
+                        pbar.set_postfix_str(f"{iid}:{attempt} {status}")
+                        pbar.update(1)
+
+                        return result
+
+                tasks = [
+                    asyncio.create_task(run_one(inst, attempt))
+                    for inst, attempt in work_items
+                ]
+                await asyncio.gather(*tasks)
+                pbar.close()
+
+            typer.echo(f"Running agents (max {max_parallel} parallel)...")
+            asyncio.run(run_all_agents())
+
+        # ---- Evaluation Phase for non-oracle ----
+        bad_eval_moved = _cleanup_bad_evals(base_out, instances, k, eval_id)
+        completed_evals = _get_completed_evals(base_out, instances, k, eval_id)
+
+        all_patches = []
+        for inst in instances:
+            iid = inst["instance_id"]
+            for attempt in range(1, k + 1):
+                if (iid, attempt) in completed_evals:
+                    continue
+
+                pred_path = base_out / iid / f"attempt_{attempt}" / "rollout" / f"{iid}.pred"
+                patch = ""
+                if pred_path.exists():
+                    try:
+                        pred_data = json.loads(pred_path.read_text())
+                        patch = pred_data.get("model_patch", "")
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+                all_patches.append({
                 "instance_id": iid,
                 "patch": patch,
                 "prefix": eval_id,

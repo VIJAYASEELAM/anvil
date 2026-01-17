@@ -223,23 +223,19 @@ async def run_agent_in_modal(
             env_secrets.append(modal.Secret.from_dict(agent_config.extra_env))
 
         sandbox = await modal.Sandbox.create.aio(
-            "bash",
-            "-lc",
-            script,
+            "bash", "-lc", script,
             image=img,
             timeout=agent_config.timeout,
             app=app,
             secrets=env_secrets if env_secrets else None,
         )
-
         if on_running:
             on_running(instance_id)
-
         await sandbox.wait.aio()
-
         raw_stdout = await sandbox.stdout.read.aio()
         stderr = await sandbox.stderr.read.aio()
         exit_code = sandbox.returncode
+        await sandbox.terminate.aio()
 
         patch = _extract_between_markers(
             raw_stdout, PATCH_START_MARKER, PATCH_END_MARKER
@@ -268,8 +264,6 @@ async def run_agent_in_modal(
                 stdout = stdout[:s_idx] + stdout[e_idx:]
             except ValueError:
                 pass
-
-        await sandbox.terminate.aio()
 
         duration = time.time() - start_time
 

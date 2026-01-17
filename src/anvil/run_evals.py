@@ -8,13 +8,13 @@ import typer
 
 
 def run_evals(
-    model: str = typer.Option(
-        ..., "--model", help="Model ID (litellm-compatible, e.g., openrouter/google/gemini-3-flash-preview)"
+    model: str | None = typer.Option(
+        None, "--model", help="Model ID (required for agents, optional for oracle)"
     ),
     dataset: str = typer.Option(..., "--dataset", help="Dataset ID or path"),
     agent: Annotated[
-        Literal["mini-swe-agent"],
-        typer.Option("--agent", help="Agent to use for evaluation"),
+        Literal["mini-swe-agent", "oracle"],
+        typer.Option("--agent", help="Agent to use for evaluation (oracle runs golden patches)"),
     ] = "mini-swe-agent",
     n_attempts: Annotated[
         int,
