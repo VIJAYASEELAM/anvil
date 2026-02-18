@@ -262,7 +262,9 @@ def eval_with_modal(
 ):
     if modal is None:
         raise RuntimeError("modal is not installed")
+
     uid = sample["instance_id"]
+
     existing_output, output_path, workspace_dir, uid_dir = prepare_run(
         uid, output_dir, prefix, redo, attempt=attempt
     )
@@ -270,20 +272,22 @@ def eval_with_modal(
         return existing_output
 
     sandbox = None
-    
+
     try:
         write_patch_snapshot(uid_dir, prefix, patch)
         files, entryscript_content = assemble_workspace_files(uid, scripts_dir, patch, sample)
 
         app = modal.App.lookup(name="anvil-swe-bench-eval", create_if_missing=True)
-        
-        # Use image_name from instances.yaml if available, otherwise construct it
+
+        # Use image_name from instances.yaml if available
         if "image_name" in sample and sample["image_name"]:
             dockerhub_image_uri = sample["image_name"]
         else:
-            dockerhub_image_uri = get_dockerhub_image_uri(uid, dockerhub_username, dockerhub_repo, sample.get("repo", ""))
+            dockerhub_image_uri = get_dockerhub_image_uri(
+                uid, dockerhub_username, dockerhub_repo, sample.get("repo", "")
+            )
 
-        # Registry credentials for private Docker Hub images
+        # Optional DockerHub credentials
         registry_secret = None
         if os.environ.get("REGISTRY_USERNAME") and os.environ.get("REGISTRY_PASSWORD"):
             registry_secret = modal.Secret.from_dict({
@@ -291,18 +295,26 @@ def eval_with_modal(
                 "REGISTRY_PASSWORD": os.environ["REGISTRY_PASSWORD"],
             })
 
+        # ✅ FIXED IMAGE SECTION (NO force_build)
         image = modal.Image.from_registry(
-            dockerhub_image_uri, secret=registry_secret, force_build=True,
-        ).dockerfile_commands(['CMD ["sleep", "infinity"]'])
+            dockerhub_image_uri,
+            secret=registry_secret
+        )
 
         sandbox = modal.Sandbox.create(
-            image=image, app=app, timeout=60 * 60,
-            cpu=(1, 4), memory=(5 * 1024, 30 * 1024), block_network=block_network,
+            image=image,
+            app=app,
+            timeout=60 * 60,
+            cpu=(1, 4),
+            memory=(5 * 1024, 30 * 1024),
+            block_network=block_network,
         )
 
         process = sandbox.exec("mkdir", "-p", "/workspace")
         process.wait()
+
         write_files_modal(sandbox, files)
+
         process = sandbox.exec("bash", "/workspace/entryscript.sh")
         process.wait()
 
@@ -310,13 +322,17 @@ def eval_with_modal(
             print(f"Entryscript failed for {uid} with return code: {process.returncode}")
 
         output = collect_outputs_modal(sandbox, uid_dir, uid, prefix)
+
         if output is None:
             return None
+
         save_entryscript_copy(uid_dir, prefix, entryscript_content)
         return output
+
     except Exception as e:
         print(f"Error evaluating {uid}: {e}")
         raise
+
     finally:
         if sandbox:
             try:
