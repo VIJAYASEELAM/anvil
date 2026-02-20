@@ -66,13 +66,35 @@ def get_dockerhub_image_uri(uid: str, dockerhub_username: str, dockerhub_repo: s
 # ---- Docker helpers ----
 
 def load_base_docker(iid):
-    with open(f"dockerfiles/base_dockerfile/{iid}/Dockerfile") as fp:
-        return fp.read()
+    path = f"dockerfiles/base_dockerfile/{iid}/Dockerfile"
+    try:
+        with open(path) as fp:
+            return fp.read()
+    except FileNotFoundError:
+        return ""
 
 
 def instance_docker(iid):
-    with open(f"dockerfiles/instance_dockerfile/{iid}/Dockerfile") as fp:
-        return fp.read()
+    # Try expected dockerfiles location first
+    path = f"dockerfiles/instance_dockerfile/{iid}/Dockerfile"
+    try:
+        with open(path) as fp:
+            return fp.read()
+    except FileNotFoundError:
+        # Fallback: some datasets place Dockerfiles under the dataset task directories
+        try:
+            # If iid like 'my-dataset.task-3', try 'my-dataset/task-3/Dockerfile'
+            if iid.startswith("my-dataset.task-"):
+                parts = iid.split("my-dataset.task-")
+                if len(parts) == 2 and parts[1].isdigit():
+                    n = parts[1]
+                    alt_path = f"my-dataset/task-{n}/Dockerfile"
+                    with open(alt_path) as fp:
+                        return fp.read()
+        except Exception:
+            pass
+        # Final fallback: return empty string
+        return ""
 
 
 def load_local_script(scripts_dir, instance_id, script_name):
@@ -124,8 +146,16 @@ git checkout {base_commit} 2>/dev/null || true
 git apply -v --ignore-whitespace /workspace/patch.diff 2>&1 || \\
 patch -p1 --forward --reject-file=- --no-backup-if-mismatch < /workspace/patch.diff 2>&1 || true
 {before_repo_set_cmd}
+# Ensure pip and pytest are available; install project requirements if present.
+python3 -m pip install --upgrade pip setuptools wheel > /workspace/pip_install.log 2>&1 || true
+if [ -f /app/requirements.txt ]; then
+    python3 -m pip install -r /app/requirements.txt >> /workspace/pip_install.log 2>&1 || true
+fi
+python3 -m pip install pytest >> /workspace/pip_install.log 2>&1 || true
+
+# Run tests and parse results
 bash /workspace/run_script.sh {selected_test_files_to_run} > /workspace/stdout.log 2> /workspace/stderr.log
-python3 /workspace/parser.py /workspace/stdout.log /workspace/stderr.log /workspace/output.json
+python3 /workspace/parser.py /workspace/stdout.log /workspace/stderr.log /workspace/output.json "{sample.get('fail_to_pass', '')}" "{sample.get('pass_to_pass', '')}"
 """
     return entry_script
 
@@ -471,7 +501,7 @@ def main():
             executor.submit(
                 eval_fn,
                 patch_sample.get("model_patch", patch_sample.get("patch", "")),
-                raw_sample_df.loc[patch_sample["instance_id"]],
+                raw_sample_df.loc[patch_sample["instance_id"]].to_dict(),
                 args.output_dir, args.dockerhub_username, args.scripts_dir, args.dockerhub_repo,
                 prefix=patch_sample.get("prefix", ""), redo=args.redo,
                 block_network=args.block_network,
